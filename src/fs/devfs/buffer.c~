@@ -1,0 +1,114 @@
+#include <fs/devfs/buffer.h>
+
+struct buffer_head *buff_head[256];
+struct buffer_head *mru_buff;
+struct buffer_head *lru_buff;
+
+void init_buffer(void)
+{
+	memset(buff_head + 1, 0, 255 * sizeof(struct buffer_head*));
+	buff_head[0] = (struct buffer_head*)kmalloc(sizeof(struct buffer_head));
+	buff_head[0]->prev = 0;
+	buff_head[0]->prev_free = 0;
+	lru_buff = buff_head[0];
+	struct buffer_head *current_buff = buff_head[0];
+	for (size_t i = 1; i < MAX_BUFFER; i++)
+	{
+		current_buff->next = (struct buffer_head*)kmalloc(sizeof(struct buffer_head));
+		current_buff->next_free = current_buff->next;
+		current_buff->next->prev = current_buff;
+		current_buff->next->prev_free = current_buff;
+		current_buff = current_buff->next;
+	}
+	mru_buff = current_buff;
+}
+
+struct buffer_head *get_block(uint32_t block, device_t dev)
+{
+	struct buffer_head **head = &buff_head[block & 0xFF];
+	while (*head)
+	{
+		terminal_putchar('a');
+		if ((*head)->block_num == block && (*head)->dev == dev)
+		{
+		        terminal_printhex32(block);
+			/* 
+			 *  dirty blocks are only written to disk when:
+			 *  evicted from the linked list of free blocks or
+			 *  a sync syscall is executed.
+			 */
+			if ((*head)->count == 0)
+			{
+				if ((*head)->prev_free)
+					(*head)->prev_free->next_free = (*head)->next_free;
+				if ((*head)->next_free)
+					(*head)->next_free->prev_free = (*head)->prev_free;
+				(*head)->next_free = 0;
+				(*head)->prev_free = 0;
+				if ((*head)->dirty == true)
+				{
+					ata_write_sects_28_pio((*head)->buff, 1,
+							       find_bdev(dev), block);
+					(*head)->dirty = false;
+				}
+			}
+			(*head)->count++;
+			return *head;
+		}
+		head = &(*head)->next;
+	}terminal_writestring("got here");
+	struct buffer_head *new_head = lru_buff;
+	//if (lru_buff->next_free)
+	lru_buff = lru_buff->next_free;
+	if (lru_buff)
+		lru_buff->prev_free = NULL;
+	if (new_head->dirty == true)
+	{
+		ata_write_sects_28_pio(new_head->buff, 1,
+				       find_bdev(new_head->dev), new_head->block_num);
+	        new_head->dirty = false;
+	}
+        new_head->count++;
+        new_head->block_num = block;
+        new_head->dev = dev;
+	ata_read_sects_28_pio(new_head->buff, 1, find_bdev(dev), block);
+	/*(*head)->next = buff_head[block & 0xFF];
+        if ((*head)->next)
+		(*head)->next->prev = *head;
+		buff_head[block & 0xFF] = *head;*/
+        new_head->next = buff_head[block & 0xFF];
+	if (new_head->next)
+		new_head->next->prev = new_head;
+	buff_head[block & 0xFF] = new_head;
+        new_head->next_free = 0;
+        new_head->prev_free = 0;
+        new_head->prev = 0;
+	return new_head;
+}
+
+void put_block(struct buffer_head *block)
+{
+	if (block->count > 1)
+	{
+		block->count--;
+		return;
+	}
+
+	if (block->flags == CLASS_DIR)
+	{
+		mru_buff->next_free = block;
+		block->prev_free = mru_buff;
+		mru_buff = block;
+		/*if (block->dirty == true)
+		{
+			ata_write_sects_28_pio(block->buff, 1, find_bdev(block->dev), block->block_num);
+			block->dirty = false;
+			}*/
+	}
+	else
+	{
+		lru_buff->prev_free = block;
+		block->next_free = lru_buff;
+		lru_buff = block;
+	}
+}
